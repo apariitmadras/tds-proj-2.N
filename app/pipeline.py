@@ -33,9 +33,7 @@ async def make_plan_with_gemini(task: str) -> str:
         try:
             resp = _GEMINI_CLIENT.models.generate_content(
                 model=GEMINI_MODEL,
-                contents=[sys_prompt, task],
-                generation_config=_GEN_CONFIG,
-            )
+                contents=[sys_prompt, task])
             plan = resp.text.strip()
             Path("/tmp/breaked_task.txt").write_text(plan, encoding="utf-8")
             return plan
