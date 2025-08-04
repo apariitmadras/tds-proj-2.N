@@ -2,23 +2,29 @@ import os, asyncio, json
 from typing import List
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
 import openai
 
 from .tools import scrape_website, get_relevant_data, answer_questions
 from .models import AnswerPayload
 
 # ---------------------------------------------------------------------------
-GEN_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
 
 # ---------------------------------------------------------------------------
 async def make_plan_with_gemini(task: str) -> str:
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     sys_prompt = Path(__file__).with_name("prompts").joinpath("breakdown.txt").read_text()
-    chat = genai.GenerativeModel(GEN_MODEL).start_chat(history=[{"role": "system", "parts": sys_prompt}])
-    resp = chat.send_message(task)
-    return resp.text
+
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[sys_prompt, task],
+        generation_config={"temperature": 0.2},
+    )
+    plan = resp.text.strip()
+    Path("/tmp/breaked_task.txt").write_text(plan, encoding="utf-8")
+    return plan
 
 # ---------------------------------------------------------------------------
 async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
