@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-import json
-import os
+import asyncio, json, os, random
 from pathlib import Path
 from typing import Any, Dict, List
 
-import asyncio, random
+# ── 1. Gemini (planner) ────────────────────────────────────────────────────
+from google import genai                          # google-genai ≥1.0
 from google.genai.errors import ServerError
-
-# ── 1. Gemini – planner ────────────────────────────────────────────────────
-from google import genai                   # google-genai ≥ 1.x (v1 API)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
 _GEMINI_CLIENT = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-# ── 2. OpenAI – executor ───────────────────────────────────────────────────
-from openai import AsyncOpenAI             # openai-python ≥ 1.x
+# ── 2. OpenAI (executor) ───────────────────────────────────────────────────
+from openai import AsyncOpenAI                    # openai-python ≥1.0
 OPENAI_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
 _OPENAI_CLIENT = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -24,12 +21,14 @@ from .tools import scrape_website, get_relevant_data, answer_questions
 from .models import AnswerPayload
 
 # ───────────────────────────────────────────────────────────────────────────
-# ❶  PLANNING  –  Gemini writes a step-by-step plan
+# ❶  PLANNING  – Gemini writes a step-by-step plan
 # ───────────────────────────────────────────────────────────────────────────
-
 async def make_plan_with_gemini(task: str) -> str:
-    sys_prompt = (Path(__file__).with_name("prompts").joinpath("breakdown.txt").read_text())
-    for attempt in range(3):         # ≤3 tries: 0,1,2
+    sys_prompt = (
+        Path(__file__).with_name("prompts").joinpath("breakdown.txt").read_text()
+    )
+
+    for attempt in range(3):                                   # retry ≤3×
         try:
             resp = _GEMINI_CLIENT.models.generate_content(
                 model=GEMINI_MODEL,
@@ -37,15 +36,13 @@ async def make_plan_with_gemini(task: str) -> str:
             plan = resp.text.strip()
             Path("/tmp/breaked_task.txt").write_text(plan, encoding="utf-8")
             return plan
-        except ServerError as e:
-            if attempt == 2:          # last attempt – re-raise
+        except ServerError:                                     # 503 etc.
+            if attempt == 2:
                 raise
-            # jittered back-off: 1s, 2s
-            await asyncio.sleep((2 ** attempt) + random.random())
-
+            await asyncio.sleep((2**attempt) + random.random())  # 1 s, 2 s
 
 # ───────────────────────────────────────────────────────────────────────────
-# ❷  EXECUTION  –  GPT-4o-mini + function-calling tools
+# ❷  EXECUTION  – GPT-4o-mini + function-calling tools
 # ───────────────────────────────────────────────────────────────────────────
 async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
     tools_schema: List[Dict[str, Any]] = [
@@ -53,7 +50,7 @@ async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
             "type": "function",
             "function": {
                 "name": "scrape_website",
-                "description": "Download raw HTML and store it in a temp file.",
+                "description": "Download raw HTML and save to a temp file.",
                 "parameters": {
                     "type": "object",
                     "properties": {"url": {"type": "string"}},
@@ -95,7 +92,6 @@ async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
         {"role": "user", "content": task},
     ]
 
-    # helper to execute a single tool call
     async def _dispatch(call) -> str:
         fn = call.function.name
         args = json.loads(call.function.arguments)
@@ -107,7 +103,6 @@ async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
             return await answer_questions(**args)
         raise ValueError(f"unknown tool {fn}")
 
-    # initial request to GPT-4o-mini
     resp = await _OPENAI_CLIENT.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
@@ -115,23 +110,21 @@ async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
         tool_choice="auto",
     )
 
-    # ── main tool-execution loop ───────────────────────────────────────────
+    # ── tool-execution loop ────────────────────────────────────────────────
     while resp.choices[0].finish_reason == "tool_calls":
         assistant_msg = resp.choices[0].message
-        messages.append(assistant_msg)  # keep assistant function-call message
+        messages.append(assistant_msg)
 
-        # handle each tool call and send matching tool reply
         for tc in assistant_msg.tool_calls:
             result = await _dispatch(tc)
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": tc.id,   # 🔑 required in openai-python ≥ 1.x
+                    "tool_call_id": tc.id,         # required ≥1.0
                     "content": result,
                 }
             )
 
-        # ask the model what’s next (or to finish)
         resp = await _OPENAI_CLIENT.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
@@ -139,6 +132,27 @@ async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
             tool_choice="auto",
         )
 
-    # ── final answer ──────────────────────────────────────────────────────
-    final_json = json.loads(resp.choices[0].message.content)
-    return AnswerPayload(answers=final_json)
+    # ── final answer — retry once if not JSON ─────────────────────────────
+    def _parse(s: str):
+        try:  return json.loads(s)
+        except json.JSONDecodeError:  return None
+
+    answer = _parse(resp.choices[0].message.content)
+    if answer is None:
+        messages.append(resp.choices[0].message)
+        messages.append(
+            {
+                "role": "system",
+                "content": "⚠️ Previous reply was not valid JSON. "
+                           "Respond again with ONLY the JSON array.",
+            }
+        )
+        resp = await _OPENAI_CLIENT.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+        )
+        answer = _parse(resp.choices[0].message.content)
+        if answer is None:
+            raise ValueError("GPT final reply still not JSON.")
+
+    return AnswerPayload(answers=answer)
