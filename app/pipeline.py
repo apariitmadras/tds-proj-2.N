@@ -5,6 +5,9 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List
 
+import asyncio, random
+from google.genai.errors import ServerError
+
 # ── 1. Gemini – planner ────────────────────────────────────────────────────
 from google import genai                   # google-genai ≥ 1.x (v1 API)
 
@@ -23,14 +26,25 @@ from .models import AnswerPayload
 # ───────────────────────────────────────────────────────────────────────────
 # ❶  PLANNING  –  Gemini writes a step-by-step plan
 # ───────────────────────────────────────────────────────────────────────────
+
 async def make_plan_with_gemini(task: str) -> str:
-    sys_prompt = Path(__file__).with_name("prompts").joinpath("breakdown.txt").read_text()
-    resp = _GEMINI_CLIENT.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[sys_prompt, task])
-    plan = resp.text.strip()
-    Path("/tmp/breaked_task.txt").write_text(plan, encoding="utf-8")  # optional logging
-    return plan
+    sys_prompt = ...
+    for attempt in range(3):         # ≤3 tries: 0,1,2
+        try:
+            resp = _GEMINI_CLIENT.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[sys_prompt, task],
+                generation_config=_GEN_CONFIG,
+            )
+            plan = resp.text.strip()
+            Path("/tmp/breaked_task.txt").write_text(plan, encoding="utf-8")
+            return plan
+        except ServerError as e:
+            if attempt == 2:          # last attempt – re-raise
+                raise
+            # jittered back-off: 1s, 2s
+            await asyncio.sleep((2 ** attempt) + random.random())
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # ❷  EXECUTION  –  GPT-4o-mini + function-calling tools
