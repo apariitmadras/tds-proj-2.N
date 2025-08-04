@@ -11,7 +11,6 @@ from google import genai                                           # google-gena
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
 _GEMINI_CLIENT = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-_GEN_CONFIG = genai.GenerationConfig(temperature=0.2)
 
 # ─── OpenAI (executor) ──────────────────────────────────────────────────────
 from openai import AsyncOpenAI                                      # openai-python ≥1
@@ -34,9 +33,7 @@ async def make_plan_with_gemini(task: str) -> str:
 
     resp = _GEMINI_CLIENT.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[sys_prompt, task],                # two-message chat
-        generation_config=_GEN_CONFIG,
-    )
+        contents=[sys_prompt, task])
     plan = resp.text.strip()
     # (optional) persist like the original repo
     Path("/tmp/breaked_task.txt").write_text(plan, encoding="utf-8")
