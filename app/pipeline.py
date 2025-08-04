@@ -1,34 +1,54 @@
-import os, asyncio, json
-from typing import List
+from __future__ import annotations
+
+import asyncio
+import json
+import os
 from pathlib import Path
+from typing import Any, Dict, List
 
-from google import genai
-import openai
+# ─── Google Gemini (planner) ────────────────────────────────────────────────
+from google import genai                                           # google-genai v1
 
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
+_GEMINI_CLIENT = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+_GEN_CONFIG = genai.GenerationConfig(temperature=0.2)
+
+# ─── OpenAI (executor) ──────────────────────────────────────────────────────
+from openai import AsyncOpenAI                                      # openai-python ≥1
+OPENAI_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
+_OPENAI_CLIENT = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+# ─── Local tools & response schema ─────────────────────────────────────────
 from .tools import scrape_website, get_relevant_data, answer_questions
 from .models import AnswerPayload
 
-# ---------------------------------------------------------------------------
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
-GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# ❶  PLANNING STAGE  –  Gemini writes a step-by-step plan
+# ────────────────────────────────────────────────────────────────────────────
 async def make_plan_with_gemini(task: str) -> str:
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    sys_prompt = Path(__file__).with_name("prompts").joinpath("breakdown.txt").read_text()
+    """Return a four-stage plan as plain text."""
+    sys_prompt = (
+        Path(__file__).with_name("prompts").joinpath("breakdown.txt").read_text()
+    )
 
-    resp = client.models.generate_content(
+    resp = _GEMINI_CLIENT.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[sys_prompt, task])
+        contents=[sys_prompt, task],                # two-message chat
+        generation_config=_GEN_CONFIG,
+    )
     plan = resp.text.strip()
+    # (optional) persist like the original repo
     Path("/tmp/breaked_task.txt").write_text(plan, encoding="utf-8")
     return plan
 
-# ---------------------------------------------------------------------------
-async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
-    openai.api_key = os.environ["OPENAI_API_KEY"]
 
-    tools_schema = [
+# ────────────────────────────────────────────────────────────────────────────
+# ❷  EXECUTION STAGE  –  GPT-4o-mini + tool calls
+# ────────────────────────────────────────────────────────────────────────────
+async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
+    """Run the analysis task end-to-end and return the final JSON answer."""
+    tools_schema: List[Dict[str, Any]] = [
         {
             "type": "function",
             "function": {
@@ -45,7 +65,7 @@ async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
             "type": "function",
             "function": {
                 "name": "get_relevant_data",
-                "description": "Parse HTML file and extract elements matching a CSS selector.",
+                "description": "Extract elements from an HTML file via CSS selector.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -60,7 +80,7 @@ async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
             "type": "function",
             "function": {
                 "name": "answer_questions",
-                "description": "Execute analysis Python and return its stdout.",
+                "description": "Execute arbitrary Python code and return its stdout.",
                 "parameters": {
                     "type": "object",
                     "properties": {"python_code": {"type": "string"}},
@@ -70,23 +90,15 @@ async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
         },
     ]
 
-    # ---- initial user message ----
-    messages = [
-        {"role": "system", "content": "You are a smart data‑analysis agent."},
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": "You are a smart data-analysis agent."},
         {"role": "user", "content": task},
     ]
 
-    resp = await openai.ChatCompletion.acreate(
-        model=GPT_MODEL,
-        messages=messages,
-        tools=tools_schema,
-        tool_choice="auto",
-        stream=False,
-    )
-
-    async def dispatch(call):
-        fn_name = call["function_call"]["name"]
-        args = json.loads(call["function_call"]["arguments"])
+    # helper to execute a single tool call ----------------------------------
+    async def _dispatch(tool_call) -> str:
+        fn_name = tool_call.function.name
+        args = json.loads(tool_call.function.arguments)
         if fn_name == "scrape_website":
             return await scrape_website(**args)
         if fn_name == "get_relevant_data":
@@ -95,20 +107,30 @@ async def run_plan_with_gpt_tools(task: str) -> AnswerPayload:
             return await answer_questions(**args)
         raise ValueError(f"Unknown tool {fn_name}")
 
-    # Iterate if model returns multiple tool steps (simple linear loop)
+    # first LLM call --------------------------------------------------------
+    resp = await _OPENAI_CLIENT.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        tools=tools_schema,
+        tool_choice="auto",
+    )
+
+    # tool-loop (linear, no recursion) --------------------------------------
     while resp.choices[0].finish_reason == "tool_calls":
         results = []
-        for call in resp.choices[0].message.tool_calls:
-            results.append(await dispatch(call))
-        messages.append(resp.choices[0].message)
-        messages.append({"role": "tool", "content": json.dumps(results)})
-        resp = await openai.ChatCompletion.acreate(
-            model=GPT_MODEL,
+        for tc in resp.choices[0].message.tool_calls:
+            results.append(await _dispatch(tc))
+        messages.append(resp.choices[0].message)  # function call message
+        messages.append(                         # tool response message
+            {"role": "tool", "content": json.dumps(results)}
+        )
+        resp = await _OPENAI_CLIENT.chat.completions.create(
+            model=OPENAI_MODEL,
             messages=messages,
             tools=tools_schema,
             tool_choice="auto",
-            stream=False,
         )
 
+    # final answer ----------------------------------------------------------
     final_json = json.loads(resp.choices[0].message.content)
     return AnswerPayload(answers=final_json)
