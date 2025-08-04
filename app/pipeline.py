@@ -28,7 +28,7 @@ from .models import AnswerPayload
 # ───────────────────────────────────────────────────────────────────────────
 
 async def make_plan_with_gemini(task: str) -> str:
-    sys_prompt = ...
+    sys_prompt = (Path(__file__).with_name("prompts").joinpath("breakdown.txt").read_text())
     for attempt in range(3):         # ≤3 tries: 0,1,2
         try:
             resp = _GEMINI_CLIENT.models.generate_content(
