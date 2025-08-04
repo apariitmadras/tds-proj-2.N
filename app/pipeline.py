@@ -9,7 +9,7 @@ from .tools import scrape_website, get_relevant_data, answer_questions
 from .models import AnswerPayload
 
 # ---------------------------------------------------------------------------
-GEN_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-1.0-pro")
+GEN_MODEL = os.getenv("GEMINI_MODEL", "gemini-pro")
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
 
 # ---------------------------------------------------------------------------
