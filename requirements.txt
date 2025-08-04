@@ -2,7 +2,7 @@ fastapi[all]
 uvicorn[standard]
 pydantic>=2
 openai>=1.30
-google-generativeai>=1.28
+google-genai>=1.28
 requests
 beautifulsoup4
 python-dotenv
